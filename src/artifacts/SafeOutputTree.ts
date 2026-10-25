@@ -22,6 +22,11 @@ import {
 } from "./ArtifactPaths.js";
 import { absoluteCallerPath } from "../filesystem/callerPath.js";
 import { ArtifactReaderFailure } from "./ArtifactReader.js";
+import { SafeOutputSourceFailure } from "./SafeOutputSourceFailure.js";
+import {
+  readSourceChunks,
+  settleSourceDestruction,
+} from "./SafeOutputSourceLifecycle.js";
 import { SafeOutputTreeDestinationRefusal } from "./SafeOutputTreeAdmission.js";
 import { SafeOutputTreeCreationFailure } from "./SafeOutputTreeCreationFailure.js";
 import { hashOutputFile } from "./SafeOutputTreeReadback.js";
@@ -236,6 +241,25 @@ export class SafeOutputTree {
     expected: { readonly sha256: string; readonly bytes: number },
     signal?: AbortSignal,
   ): Promise<SafeOutputFile> {
+    // Own errors before asynchronous destination setup, without starting reads.
+    // Retain the observer through destruction, including late cleanup errors.
+    const sourceFailures = new Set<unknown>();
+    const observeSourceFailure = (failure: unknown): void => {
+      sourceFailures.add(failure);
+    };
+    if (source.errored !== null) observeSourceFailure(source.errored);
+    source.on("error", observeSourceFailure);
+    // Cancellation bounds the join; an unsettled destruction stays owned.
+    const unsettled: ArtifactReaderFailure[] = [];
+    const settleSource = async (): Promise<void> => {
+      if (unsettled.length > 0) return;
+      const retained = await settleSourceDestruction(
+        source,
+        signal,
+        `input stream for ${relativePath}`,
+      );
+      if (retained !== undefined) unsettled.push(retained);
+    };
     try {
       this.#assertWritable();
       if (!Number.isSafeInteger(expected.bytes) || expected.bytes < 0)
@@ -286,7 +310,11 @@ export class SafeOutputTree {
       const hash = createHash("sha256");
       let bytes = 0;
       await this.#assertLineage(lineage);
-      for await (const raw of source) {
+      // Setup can observe an error event without the stream ending or entering
+      // its destroyed/errored state. Do not wait for a second event to exit.
+      if (sourceFailures.size > 0) throw sourceFailures.values().next().value;
+      abortIfNeeded(signal);
+      for await (const raw of readSourceChunks(source, signal)) {
         abortIfNeeded(signal);
         const chunk = streamChunkToBuffer(raw);
         if (chunk.length > expected.bytes - bytes)
@@ -298,6 +326,8 @@ export class SafeOutputTree {
         hash.update(chunk);
         await writeAll(ownedHandle.handle, chunk);
       }
+      // Reading also stops when cancellation ends a wait for the next chunk.
+      abortIfNeeded(signal);
       if (bytes !== expected.bytes)
         throw new ArtifactReaderFailure(
           "integrity",
@@ -330,14 +360,34 @@ export class SafeOutputTree {
           "integrity",
           `Durable readback verification failed: ${path}`,
         );
+      await settleSource();
+      if (sourceFailures.size > 0) throw sourceFailures.values().next().value;
+      abortIfNeeded(signal);
       return { relativePath: path, sha256, bytesWritten: bytes };
     } catch (cause: unknown) {
       try {
         source.destroy();
-      } catch {
-        // Preserve the write refusal or failure as the caller-visible error.
+        await settleSource();
+      } catch (cleanupCause: unknown) {
+        observeSourceFailure(cleanupCause);
       }
+      const secondaryFailures = [...sourceFailures, ...unsettled].filter(
+        (failure) => failure !== cause,
+      );
+      const primaryIsSource = sourceFailures.has(cause);
+      if (
+        secondaryFailures.length > 0 ||
+        (primaryIsSource &&
+          ArtifactReaderFailure.from(cause).cleanup !== undefined)
+      )
+        throw new SafeOutputSourceFailure(
+          cause,
+          secondaryFailures,
+          primaryIsSource,
+        );
       throw cause;
+    } finally {
+      source.off("error", observeSourceFailure);
     }
   }
 

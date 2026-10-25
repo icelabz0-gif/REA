@@ -34,29 +34,35 @@ it("preserves a real ZIP stream's caller cancellation through extraction rollbac
       ...args: Parameters<SafeOutputTree["write"]>
     ) {
       const [relativePath, stream, expected, signal] = args;
-      const iterator = stream[Symbol.asyncIterator]();
-      const next = iterator.next.bind(iterator);
-      iterator.next = async (...nextArgs: Parameters<typeof iterator.next>) => {
-        if (chunks === 1) {
-          // The first ZIP chunk reached the actual output file. Abort before
-          // requesting the next chunk, so the ZIP stream owns this failure.
-          expect(
-            (await readFile(join(output, relativePath))).length,
-          ).toBeGreaterThan(0);
-          controller.abort(reason);
-        }
-        try {
-          const result = await next(...nextArgs);
-          if (!result.done) chunks += 1;
-          return result;
-        } catch (failure) {
-          zipFailure = failure;
-          throw failure;
-        }
-      };
+      const createIterator = stream.iterator.bind(stream);
       const iteratorSpy = vi
-        .spyOn(stream, Symbol.asyncIterator)
-        .mockReturnValue(iterator);
+        .spyOn(stream, "iterator")
+        .mockImplementation((options) => {
+          // Observe the consumer's real iterator without changing its close policy.
+          const iterator = createIterator(options);
+          const next = iterator.next.bind(iterator);
+          iterator.next = async (
+            ...nextArgs: Parameters<typeof iterator.next>
+          ) => {
+            if (chunks === 1) {
+              // The first ZIP chunk reached the actual output file. Abort before
+              // requesting the next chunk, so the ZIP stream owns this failure.
+              expect(
+                (await readFile(join(output, relativePath))).length,
+              ).toBeGreaterThan(0);
+              controller.abort(reason);
+            }
+            try {
+              const result = await next(...nextArgs);
+              if (!result.done) chunks += 1;
+              return result;
+            } catch (failure) {
+              zipFailure = failure;
+              throw failure;
+            }
+          };
+          return iterator;
+        });
       try {
         return await originalWrite.call(
           this,

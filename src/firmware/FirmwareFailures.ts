@@ -1,5 +1,9 @@
-import type { AnalysisCleanupLease } from "../artifacts/AnalysisCleanupLease.js";
+import {
+  AnalysisCleanupLeaseGroup,
+  type AnalysisCleanupLease,
+} from "../artifacts/AnalysisCleanupLease.js";
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
+import { SafeOutputSourceFailure } from "../artifacts/SafeOutputSourceFailure.js";
 import {
   ArtifactFileCleanupFailure,
   artifactFileCompletion,
@@ -131,6 +135,77 @@ export const firmwareFailure = (
   cause: unknown,
   context: FirmwareFailureContext,
 ): AnalysisError => {
+  if (cause instanceof SafeOutputSourceFailure) {
+    // Source cleanup has its own authority, even when the producer cannot name
+    // an exact lease. Output rollback cannot establish that it completed.
+    const sourceContext = { ...context, treeCleanupLease: undefined };
+    const primary = firmwareFailure(
+      cause.cause,
+      cause.primaryIsSource ? sourceContext : context,
+    );
+    const secondary = cause.sourceFailures.map((failure) =>
+      firmwareFailure(failure, sourceContext),
+    );
+    const pending = secondary.filter((failure) => failure.cleanupIncomplete);
+    let error = primary;
+    if (pending.length > 0) {
+      const cleanup = new ProviderCleanupError(
+        context.engine,
+        pending.flatMap((failure) => failure.cleanupResources),
+        { reason: "Publication source cleanup remains incomplete" },
+        { operation: context.operation, cause },
+      ).bindCleanupDependencies(pending);
+      error = analysisErrorWithCleanupFailure(
+        primary,
+        cleanup,
+        context.operation,
+      ).bindCleanupDependencies([primary, cleanup]);
+    }
+    for (const failure of secondary) error.retainSecondaryFailure(failure);
+    return error;
+  }
+  if (cause instanceof ArtifactFileCleanupFailure) {
+    // The outer file owner covers only its own close. Inherited write/source
+    // failures retain their independent owners through recursive translation.
+    const physical = cause.fileCleanupFailure;
+    const observation = ArtifactReaderFailure.cleanupObservation(
+      physical.cleanupCause,
+      physical.path,
+    );
+    const cleanup = new ProviderCleanupError(
+      context.engine,
+      observation.resources,
+      { reason: observation.reason },
+      { operation: context.operation, cause },
+    );
+    new AnalysisCleanupLeaseGroup(cleanup, [cause.cleanupLease]);
+    const cancellation = artifactFileCompletion(cause)?.cancellation;
+    const primary =
+      physical.outcome.kind === "failed"
+        ? firmwareFailure(physical.outcome.cause, context)
+        : cancellation === undefined
+          ? undefined
+          : firmwareCancellation(
+              context.operation,
+              cancellation.reason,
+              context.deadline,
+              context.publication,
+            );
+    return primary === undefined
+      ? cleanup
+      : analysisErrorWithCleanupFailure(
+          primary,
+          cleanup,
+          context.operation,
+        ).bindCleanupDependencies([primary, cleanup]);
+  }
+  return classifyFirmwareFailure(cause, context);
+};
+
+const classifyFirmwareFailure = (
+  cause: unknown,
+  context: FirmwareFailureContext,
+): AnalysisError => {
   const { engine, operation, deadline, treeCleanupLease, publication } =
     context;
   if (
@@ -153,27 +228,6 @@ export const firmwareFailure = (
     bindArtifactFileCleanup(cause, cleanup);
     if (cause.cleanupLeases === undefined)
       treeCleanupLease?.bindCleanupError(cleanup);
-    if (cause instanceof ArtifactFileCleanupFailure) {
-      const outcome = cause.fileCleanupFailure.outcome;
-      const cancellation = artifactFileCompletion(cause)?.cancellation;
-      const primary =
-        outcome.kind === "failed"
-          ? firmwareFailure(outcome.cause, context)
-          : cancellation !== undefined
-            ? firmwareCancellation(
-                operation,
-                cancellation.reason,
-                deadline,
-                publication,
-              )
-            : undefined;
-      if (primary !== undefined)
-        return analysisErrorWithCleanupFailure(
-          primary,
-          cleanup,
-          operation,
-        ).bindCleanupDependencies([primary, cleanup]);
-    }
     if (cause.reason === "cancelled")
       return analysisErrorWithCleanupFailure(
         firmwareCancellation(
