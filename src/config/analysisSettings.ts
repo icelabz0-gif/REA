@@ -11,6 +11,7 @@ import {
 import { regexMatchingDeadlineMsSchema } from "./regexMatchingDeadline.js";
 import { regexWorkerHeapRequestMiBSchema } from "./regexWorkerHeapRequest.js";
 import { captureDecoderOldGenerationMiBSchema } from "./captureDecoderHeap.js";
+import { nativeMatchingRepresentationBytesSchema } from "./nativeMatchingAllowance.js";
 const environmentSchemas: Readonly<Record<string, z.ZodType<number, string>>> =
   {
     REA_ASAR_MAX_HEADER_BYTES: asarMaxHeaderBytesSchema,
@@ -22,6 +23,8 @@ const environmentSchemas: Readonly<Record<string, z.ZodType<number, string>>> =
     REA_REGEX_WORKER_HEAP_REQUEST_MIB: regexWorkerHeapRequestMiBSchema,
     REA_CAPTURE_DECODER_OLD_GENERATION_MIB:
       captureDecoderOldGenerationMiBSchema,
+    REA_NATIVE_MATCHING_REPRESENTATION_BYTES:
+      nativeMatchingRepresentationBytesSchema,
   };
 export const launchAnalysisSetting = (
   id: AnalysisSettingId,
